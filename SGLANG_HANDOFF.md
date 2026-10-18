@@ -293,7 +293,7 @@ dies on recursive bootstrap.
 | **32969746** | **2026-10-15 04:44 → 06:33** | **COMPLETED 01:48** | **Qwen-inclusive resubmit (MODELS_CSV=Qwen,DeepSeek,OLMoE; 5 Qwen JSONs)** |
 | **33009540** | **2026-10-15 06:35:54 → 06:36:20** | **CANCELLED 00:00:26** | **Wrapper job ('wrap') — user-cancelled before any cell ran** |
 | **33009563** | **2026-10-15 21:03:34 → 22:19:42** | **COMPLETED 01:16** | **Final wide sweep after stride fix (commit 2ed502b4e) — DeepSeek × 5 + OLMoE × 5 (Qwen already cached)** |
-| **33139440** | **2026-10-16 09:12:57** | **PENDING** | **Mixtral BF16 TP=4 cell — `sglang-moe-eval-h100-bf16-mixtral-tp4.sbatch`, gpu-h100, 4 GPUs, 12 h wall** |
+| **33139440** | **2026-10-18 23:23:16 → 23:23:59** | **COMPLETED 00:00:43** (exit 0) | **Mixtral BF16 TP=4 cell — FAILED in 43s due to `google.protobuf` missing from `venv_sglang_0509` (see §12.6)** |
 
 `sacct -X --format=JobID,State,Elapsed,Start,End,JobName -j <id>` for any
 of these returns ground truth on what ran vs failed.
@@ -350,7 +350,7 @@ aggregator's tree-walker normalizes both, but the two namespaces
 hold different files. Safe to delete the single-dash file if you
 want a clean tree.
 
-**Missing**: Mixtral BF16 TP=4 cells (job 33139440, PENDING).
+**Missing**: Mixtral BF16 TP=4 cells (job 33139440, **FAILED Oct 18** — see §12.6 below for the sglang protobuf regression).
 
 ## 7. Verification recipe (after a fresh build)
 
@@ -527,15 +527,16 @@ NOT be included in the Jaccard comparison until rerun with
 JSONs (also at `results_wide_w8a16_h100/`) are healthy and serve as
 the vLLM-side Mixtral baseline for the 3-way comparison.
 
-### 12.5. Outstanding items
+### 12.5. Outstanding items (CORRECTED Oct 19, 2026)
 
-1. **Job 33139440** (Mixtral BF16 TP=4): PENDING on gpu-h100.
-   Expected wall time ~4–6h based on the wide sweep's MMLU cells
-   (~10 min each for OLMoE/Qwen/DeepSeek at TP=1).
-2. **Job 33143679** (vLLM Mixtral W4A16 with `--moe-backend triton`,
-   see sibling bug handoff): PENDING on gpu-h100 at 2026-10-16
-   10:24 AEST. If the capturer data is healthy, the vLLM-side
-   Mixtral W4A16 row of the Jaccard matrix can be filled in.
+1. **Re-run sglang Mixtral BF16 TP=4** after fixing the sglang
+   venv (see §12.6). 4–6h wall expected.
+2. **Drop the vLLM Mixtral W4A16 cells from the Jaccard
+   comparison** (per the corrected analysis in §12.7 — the W4A16
+   Mixtral routing data is genuinely degenerate due to int4
+   precision loss, not a capturer bug). The bf16 / fp8 / W8A16
+   Mixtral cells (and the W4A16 cells for the other 3 models)
+   provide enough weight-precision coverage.
 3. **Optional: delete the stale single-dash smoke JSON** at
    `results_sglang_bf16_h100/allenai-OLMoE-1B-7B-0924-Instruct/bf16/moe-mmlu/expert_counts.json`
    (written by job 32843922) — the sister aggregator's
@@ -545,5 +546,67 @@ the vLLM-side Mixtral baseline for the 3-way comparison.
    `layer_id` being `None` for SM80/deepseek-v2/mixtral under
    CUDA-graph replay. The patch in §2 is correct but should be
    in sglang itself.
+
+### 12.6. sglang Mixtral BF16 TP=4 failure (Oct 18) — protobuf regression
+
+Job **33139440** (the Mixtral BF16 TP=4 cell, submitted Oct 16
+09:12 AEST) started running Oct 18 23:23:16 and **failed in 43
+seconds** with exit 0 (cleanly) but produced 0 expert_counts.json
+files. The sglang server died at startup with:
+
+```
+File ".../transformers/convert_slow_tokenizer.py", line 37, in import_protobuf
+    from sentencepiece import sentencepiece_model_pb2
+File ".../sentencepiece/sentencepiece_model_pb2.py", line 5, in <module>
+    from google.protobuf.internal import builder as _builder
+ModuleNotFoundError: No module named 'google'
+```
+
+**Root cause: `google.protobuf` is missing from `venv_sglang_0509`.**
+The sglang venv was last built on Oct 11 (job 32714323) and worked
+then. Something between Oct 11 and Oct 18 (likely a `uv pip install`
+of some unrelated package, or an unfortunate upgrade) removed
+`protobuf`.
+
+**Fix**: `cd /data/scratch/projects/uom00014/vllm/venv_sglang_0509 && uv pip install protobuf` (or `pip install protobuf`). Then re-submit the sglang Mixtral BF16 TP=4 job with the same `sglang-moe-eval-h100-bf16-mixtral-tp4.sbatch`.
+
+After re-installing protobuf, also verify the capturer layer_id
+patch (`synthesize` marker) is still in the venv
+(`grep -c synthesize
+/data/scratch/projects/uom00014/vllm/venv_sglang_0509/lib/python3.11/site-packages/sglang/srt/layers/moe/routed_experts_capturer.py`
+should return ≥ 1).
+
+### 12.7. vLLM Mixtral W4A16 — corrected analysis (Oct 19, 2026)
+
+The vLLM Mixtral W4A16 cells (jobs 32517565 and 33143679) were
+initially suspected to have a capturer bug. A second-pass deep
+analysis (see the vLLM `MIXTRAL_W4A16_BUG_HANDOFF.md`) found that
+**the capturer, kernel, router, and vLLM pipeline are all
+correct** — the data genuinely reflects what the model produces
+under int4 weight quantization with `top_k=2`.
+
+The pattern across all 4 models on the W4A16 path:
+
+| Model | top_k | n_expert | Mean active experts per layer |
+|---|---|---|---|
+| OLMoE | 8 | 64 | 64.0 (all experts) |
+| Qwen3-MOE | 8 | 128 | 127.0 (99%) |
+| DeepSeek | 6 | 64 | 61.7 (96%) |
+| Mixtral | 2 | 8 | **2.52 (31%)** |
+
+The smaller the `top_k`, the worse the degeneration. The Triton
+rerun (job 33143679, Oct 18-19) produced **byte-identical**
+degenerate data to the Marlin run (job 32517565, Oct 13),
+conclusively proving the bug is NOT in the expert kernel. The
+Triton-backend workaround attempt (using `--moe-backend triton`)
+was a dead end. The actual mechanism is **router-logit collapse
+under int4 precision loss**: the W4A16 MoE outputs at deeper
+layers have lost too much dynamic range, making the bf16 gate's
+logits peak on one or two experts — catastrophically for top_k=2.
+
+**Action**: drop the Mixtral W4A16 cells from the Jaccard
+comparison (per addendum 2 §7 #5 Path C, already authorized).
+This is the same conclusion as before, but now with a confirmed
+mechanism rather than a suspected capturer bug.
 
 Co-authored-by: Hermes Agent <noreply@nousresearch.com>
