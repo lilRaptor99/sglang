@@ -609,4 +609,49 @@ comparison (per addendum 2 §7 #5 Path C, already authorized).
 This is the same conclusion as before, but now with a confirmed
 mechanism rather than a suspected capturer bug.
 
+### 12.8. TensorRT-LLM — BLOCKED at the cu13 dependency level (Oct 19, 2026)
+
+We attempted to add a **third leg** to the engine-comparison
+matrix (vllm + sglang + tensorrt-llm) by porting the MoE capturer
+to TRT-LLM's `enable_return_routed_experts` API
+(`tensorrt_llm/_torch/route_capture.py` + the `routed_experts`
+property on `RequestOutput`). Investigation found the build is
+**blocked at the cu13 dependency level** — see
+`TensorRT-LLM/TRTLLM_BUILD_BLOCKED.md` for the full analysis.
+
+Short version:
+
+- The TRT-LLM R3 (Router Replay) feature was added in commit
+  `5982425ca8` on **2026-09-21** — but the **cu13 torch pin**
+  (`torch>=2.14.0a0`) had already landed 5 days earlier in
+  `82d667fbfb`.
+- PyPI only has TRT-LLM source tarballs (no wheels), and the
+  latest cu12-compatible release (`1.1.0`, Dec 2025) predates
+  R3 by 9 months. The cu13-only R3 release hasn't been published
+  to PyPI yet (the next release will be 1.2.x).
+- The R3 cu13 chain pulls `nvidia-cutlass-dsl[cu13]==4.8.0.dev0`,
+  `cuda-tile>=1.0.1`, `nvidia-cuda-tileiras>=13.1,<13.2` — none
+  of which have cu12 wheels on PyPI. **No workaround possible
+  without cu13 host tools.**
+- **Spartan has CUDA 12.8 max** (verified working: `nvcc 12.8` +
+  sm_80 + sm_90 builds compile). No cu13 module is available.
+  The build tooling (cmake 3.31.8, ninja 1.11.1, ccache 4.6.3,
+  GCC 11.3.0) is all fine — the only blocker is the cu13
+  dependency chain.
+- **5 alternatives considered and rejected**: build from
+  pre-R3 commit (no R3), patch requirements.txt (CUTLASS DSL
+  kernels need cu13 wheels that don't exist), backport R3 to
+  pre-cu13 (multi-day project), NGC devel container (no Docker
+  or nvcr.io network access on Spartan).
+
+The full analysis with version timeline, commit graph, and
+build template is at `/data/projects/uom00014/TensorRT-LLM/
+TRTLLM_BUILD_BLOCKED.md` (committed in the TRT-LLM fork as
+`dacba4afe7`).
+
+**Impact on the Jaccard matrix**: only the vllm + sglang engines
+are feasible on Spartan right now. The TRT-LLM third leg would
+require either (a) admin help to install cu13 on a Spartan
+node, or (b) a different cluster with cu13 + NGC access.
+
 Co-authored-by: Hermes Agent <noreply@nousresearch.com>
